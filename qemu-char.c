@@ -79,6 +79,13 @@
 #endif
 #endif
 
+#ifdef HAVE_GNUTLS
+# include <gnutls/gnutls.h>
+# include <gnutls/crypto.h>
+#else
+# include "qemu/sha1.h"
+#endif
+
 #include "qemu/sockets.h"
 #include "ui/qemu-spice.h"
 
@@ -2409,6 +2416,12 @@ typedef struct {
     int fd, listen_fd;
     int connected;
     int max_size;
+    enum TCPCharProto {
+        TCP_PROTO_NONE,
+        TCP_PROTO_TELNET,
+        TCP_PROTO_HTTP,
+        TCP_PROTO_WEBSOCKET
+    } proto;
     int do_telnetopt;
     int do_nodelay;
     int is_unix;
@@ -2416,9 +2429,56 @@ typedef struct {
     int read_msgfds_num;
     int *write_msgfds;
     int write_msgfds_num;
+    struct {
+        enum TCPCharHttpState {
+            HTTP_STATE_REQUEST,
+            HTTP_STATE_HEADERS,
+            HTTP_STATE_WEBSOCKET,
+            HTTP_STATE_ABORT
+        } state;
+        QDict *req;
+        struct {
+            char *buf;
+            int len;
+            int maxlen;
+        } line;
+    } http;
+    struct {
+        enum TCPCharWebsocketState {
+            WEBSOCKET_STATE_HDR,        /* count=2..1 */
+            WEBSOCKET_STATE_LEN,        /* count=8..1 */
+            WEBSOCKET_STATE_MASK,       /* count=4..1 */
+            WEBSOCKET_STATE_DATA,       /* count=0..payload_len */
+            WEBSOCKET_STATE_CLOSED
+        } state;
+        unsigned count;
+        uint64_t payload_len;
+        uint8_t mask[4];
+        uint16_t code;
+        uint16_t first_code; /* First code with FIN=0 */
+        char controldata[125];
+#define  WS_FIN                  0x8000
+#define  WS_OPCODE_MASK          0x0f00
+#define   WS_OPCODE_CONT          0x0000
+#define   WS_OPCODE_TEXT          0x0100
+#define   WS_OPCODE_BINARY        0x0200
+#define   WS_OPCODE_CONTROL       0x0800        /* control message => FIN=1 */
+#define   WS_OPCODE_CLOSE        (0x0000|WS_OPCODE_CONTROL)
+#define   WS_OPCODE_PING         (0x0100|WS_OPCODE_CONTROL)
+#define   WS_OPCODE_PONG         (0x0200|WS_OPCODE_CONTROL)
+#define  WS_MASK                 0x0080         /* 4 mask bytes follow */
+#define  WS_LENGTH_MASK          0x007f
+#define  WS_LENGTH_SHIFT         0
+    } ws;
 } TCPCharDriver;
 
 static gboolean tcp_chr_accept(GIOChannel *chan, GIOCondition cond, void *opaque);
+static void tcp_chr_process_websocket(CharDriverState *chr,
+                                 TCPCharDriver *s,
+                                 uint8_t *buf, int *size);
+static void tcp_chr_process_http(CharDriverState *chr,
+                                 TCPCharDriver *s,
+                                 uint8_t *buf, int *size);
 
 #ifndef _WIN32
 static int unix_send_msgfds(CharDriverState *chr, const uint8_t *buf, int len)
@@ -2467,6 +2527,9 @@ static int unix_send_msgfds(CharDriverState *chr, const uint8_t *buf, int len)
 }
 #endif
 
+static void tcp_chr_websocket_send(CharDriverState *chr,
+        uint16_t opcode, const void *data, size_t datasz);
+
 /* Called with chr_write_lock held.  */
 static int tcp_chr_write(CharDriverState *chr, const uint8_t *buf, int len)
 {
@@ -2477,6 +2540,13 @@ static int tcp_chr_write(CharDriverState *chr, const uint8_t *buf, int len)
             return unix_send_msgfds(chr, buf, len);
         } else
 #endif
+        if (s->proto == TCP_PROTO_WEBSOCKET) {
+            tcp_chr_websocket_send(chr, WS_OPCODE_TEXT|WS_FIN, buf, len);
+            return len;
+        } else if (s->proto == TCP_PROTO_HTTP) {
+            /* ignore */
+            return len;
+        } else
         {
             return io_channel_send(s->chan, buf, len);
         }
@@ -2723,6 +2793,10 @@ static gboolean tcp_chr_read(GIOChannel *chan, GIOCondition cond, void *opaque)
         /* connection closed */
         tcp_chr_disconnect(chr);
     } else if (size > 0) {
+        if (s->proto == TCP_PROTO_HTTP)
+            tcp_chr_process_http(chr, s, buf, &size);
+        if (s->proto == TCP_PROTO_WEBSOCKET)
+            tcp_chr_process_websocket(chr, s, buf, &size);
         if (s->do_telnetopt)
             tcp_chr_process_IAC_bytes(chr, s, buf, &size);
         if (size > 0)
@@ -2784,6 +2858,649 @@ static void tcp_chr_update_read_handler(CharDriverState *chr)
     if (s->chan) {
         chr->fd_in_tag = io_add_watch_poll(s->chan, tcp_chr_read_poll,
                                            tcp_chr_read, chr);
+    }
+}
+
+/* initialize an HTTP request context (we are the server) */
+static void tcp_chr_http_init(CharDriverState *chr)
+{
+    TCPCharDriver *s = chr->opaque;
+
+    s->http.line.len = 0;
+    if (!s->http.line.buf) {
+        s->http.line.maxlen = 8192;
+        s->http.line.buf = g_malloc(s->http.line.maxlen);
+    }
+    s->http.state = HTTP_STATE_REQUEST;
+    QDECREF(s->http.req);
+    s->http.req = qdict_new();
+}
+
+/* send an HTTP status */
+static void tcp_chr_http_send_status(CharDriverState *chr, int code)
+{
+    TCPCharDriver *s = chr->opaque;
+
+    char buf[128];
+    snprintf(buf, sizeof buf, "HTTP/1.1 %d\r\n", code);
+    send_all(s->fd, buf, strlen(buf));
+}
+
+/* send an HTTP status, and terminate the connection.
+ * code 0 is special and means just close and abort the connection */
+static void tcp_chr_http_abort(CharDriverState *chr, int code)
+{
+    TCPCharDriver *s = chr->opaque;
+    if (code) {
+        tcp_chr_http_send_status(chr, code);
+        send_all(s->fd, "\r\n", 2);
+    }
+    tcp_chr_disconnect(chr);
+    s->http.state = HTTP_STATE_ABORT;
+}
+
+/* process a received HTTP request header */
+static const char *tcp_chr_process_http_hdr(TCPCharDriver *s, const char *key)
+{
+    QString *str;
+    QObject *obj;
+
+    obj = qdict_get(s->http.req, key);
+    if (!obj)
+        return NULL;
+    str = qobject_to_qstring(obj);
+    if (!str)
+        return NULL;
+    return qstring_get_str(str);
+}
+
+/* compute SHA-1 hash of a string, then return the value as BASE-64 */
+static QString *sha1_base64(QString *str)
+{
+    QString *ret;
+    gchar *b64digest;
+#ifdef HAVE_GNUTLS
+    {
+        gnutls_hash_hd_t sha1;
+        guchar *digest;
+        int digestlen;
+
+        digestlen = gnutls_hash_get_len(GNUTLS_DIG_SHA1);
+        if (gnutls_hash_init(&sha1, GNUTLS_DIG_SHA1) < 0)
+            return NULL;
+        digest = malloc(digestlen);
+        gnutls_hash(&sha1, qstring_get_str(str), qstring_get_length(str));
+        gnutls_hash_deinit(&sha1, digest);
+        b64digest = g_base64_encode(digest, digestlen);
+        free(digest);
+    }
+#else
+    {
+        SHA1_CTX ctx;
+        char digest[20];
+
+        SHA1Init(&ctx);
+        SHA1Update(&ctx, qstring_get_str(str), qstring_get_length(str));
+        SHA1Final(digest, &ctx);
+        b64digest = g_base64_encode((guchar *)digest, sizeof digest);
+    }
+#endif
+
+    ret = qstring_from_str(b64digest);
+    g_free(b64digest);
+    return ret;
+}
+
+/* Sends a websocket frame header. */
+static void tcp_chr_websocket_send_hdr(CharDriverState *chr,
+        uint16_t opcode, size_t datasz)
+{
+    TCPCharDriver *s = chr->opaque;
+    unsigned i, lenlen;
+    unsigned char hdr[10];
+
+    opcode &= ~(WS_MASK | WS_LENGTH_MASK);
+    if (datasz < 126) {
+        opcode |= datasz << WS_LENGTH_SHIFT;
+        lenlen = 0;
+    } else if (datasz <= 0xffff) {
+        opcode |= 126 << WS_LENGTH_SHIFT;
+        lenlen = 2;
+    } else {
+        opcode |= 127 << WS_LENGTH_SHIFT;
+        lenlen = 8;
+    }
+    hdr[0] = opcode >> 8;
+    hdr[1] = opcode;
+    for (i = 0; i < lenlen; i++) {
+        hdr[2 + i] = datasz >> ((lenlen - i - 1) * 8);
+    }
+    send_all(s->fd, hdr, 2 + lenlen);
+}
+
+/* Sends a websocket frame with payload data. */
+static void tcp_chr_websocket_send(CharDriverState *chr,
+        uint16_t opcode, const void *data, size_t datasz)
+{
+    TCPCharDriver *s = chr->opaque;
+
+    tcp_chr_websocket_send_hdr(chr, opcode, datasz);
+    send_all(s->fd, data, datasz);
+}
+
+/* Closes the websocket */
+static void tcp_chr_websocket_close(CharDriverState *chr)
+{
+    TCPCharDriver *s = chr->opaque;
+
+    tcp_chr_websocket_send(chr, WS_OPCODE_CLOSE | WS_FIN,
+                NULL, 0);
+    tcp_chr_disconnect(chr);
+    s->ws.state = WEBSOCKET_STATE_CLOSED;
+}
+
+/* Reinitialize to receive the next websocket frame */
+static void tcp_chr_websocket_process_start(CharDriverState *chr)
+{
+    TCPCharDriver *s = chr->opaque;
+
+    s->ws.state = WEBSOCKET_STATE_HDR;
+    s->ws.count = 2; /* waiting for two bytes */
+    s->ws.payload_len = 0;
+    s->ws.code = 0;
+}
+
+/* Received a control message
+ */
+static void tcp_chr_websocket_process_control(CharDriverState *chr,
+        uint16_t opcode, void *data, unsigned datalen)
+{
+    if (opcode == WS_OPCODE_PING) {
+        /* Repond to a ping */
+        tcp_chr_websocket_send(chr, WS_OPCODE_PONG | WS_FIN,
+                data, datalen);
+    } else if (opcode == WS_OPCODE_CLOSE) {
+        /* Client requests close */
+        if (datalen >= 2) {
+            uint8_t *n = data;
+            fprintf(stderr, "websocket close %u '%.*s'\n",
+                (n[0]<<8)|n[1], datalen - 2, (char *)data + 2);
+        }
+        tcp_chr_websocket_close(chr);
+    }
+    /* ignore other control messages */
+}
+
+/* Received partial frame data from a websocket */
+static void tcp_chr_websocket_process_data(CharDriverState *chr,
+        void *buf, int len, uint16_t opcode)
+{
+    /* Currently accept both OPCODE_TEXT (UTF-8) and OPCODE_BINARY */
+    qemu_chr_be_write(chr, buf, len);
+}
+
+/* Received a finished websocket frame */
+static void tcp_chr_websocket_process_fin(CharDriverState *chr,
+        uint16_t opcode)
+{
+}
+
+static void tcp_chr_process_websocket(CharDriverState *chr,
+                                      TCPCharDriver *s,
+                                      uint8_t *buf, int *size)
+{
+    int len, i;
+
+    while (*size) {
+        switch (s->ws.state) {
+        case WEBSOCKET_STATE_CLOSED:
+            *size = 0;
+            break;
+        case WEBSOCKET_STATE_HDR:
+            /* Receiving the first two bytes of the frame header */
+            --s->ws.count;
+            --*size;
+            if (s->ws.count) {
+                s->ws.code = *buf++ << 8;
+                break;
+            }
+            s->ws.code |= *buf++;
+            if (!s->ws.first_code && !(s->ws.code & WS_OPCODE_CONTROL)) {
+                    s->ws.first_code = s->ws.code;
+            }
+            /* Decode the payload length after 2 bytes */
+            s->ws.payload_len =
+                (s->ws.code & WS_LENGTH_MASK) >> WS_LENGTH_SHIFT;
+            if (s->ws.payload_len < 126) {
+                /* Length already received */
+                goto end_payload_len;
+            }
+            if (s->ws.code & WS_OPCODE_CONTROL) {
+                tcp_chr_websocket_close(chr); /* overlong control message */
+                break;
+            }
+            /* Prepare to receive 2 or 8 bytes of payload length */
+            s->ws.state = WEBSOCKET_STATE_LEN;
+            s->ws.count = (s->ws.payload_len == 126) ? 2 : 8;
+            s->ws.payload_len = 0;
+            break;
+        case WEBSOCKET_STATE_LEN:
+            s->ws.payload_len |= (*buf++) <<
+                (8 * ((s->ws.code & 0x200 ? 8 : 2) - s->ws.count));
+            --*size;
+            if (!--s->ws.count) {
+                /* TODO verify that minimum length coding was used */
+end_payload_len:
+                /* Fully received the payload length.*/
+                if (s->ws.code & WS_MASK) {
+                    /* Prepare to receive 4 bytes of mask data */
+                    s->ws.state = WEBSOCKET_STATE_MASK;
+                    s->ws.count = 4;
+                } else {
+                    /* No need to receive a mask */
+                    goto end_mask;
+                }
+            }
+            break;
+        case WEBSOCKET_STATE_MASK:
+            s->ws.mask[4 - s->ws.count] = *buf++;
+            --*size;
+            if (!--s->ws.count) {
+                /* Have received the full mask */
+end_mask:
+                if (s->ws.payload_len == 0) {
+                    /* No need to receive any payload */
+                    s->ws.count = 0;
+                    goto end_payload;
+                }
+                /* Prepare to receive the payload data */
+                s->ws.state = WEBSOCKET_STATE_DATA;
+                s->ws.count = 0; /* used for unmasking */
+            }
+            break;
+        case WEBSOCKET_STATE_DATA:
+            len = MIN(s->ws.payload_len, *size);
+            if (s->ws.code & WS_MASK) {
+                /* XOR with the mask bytes (defeats replay) */
+                for (i = 0; i < len; i++) {
+                    buf[i] ^= s->ws.mask[(s->ws.count + i) & 3];
+                }
+            }
+            *size -= len;
+            s->ws.payload_len -= len;
+            if (s->ws.code & WS_OPCODE_CONTROL) {
+                /* Buffer control data messages, which are short */
+                memcpy(s->ws.controldata + s->ws.count, buf, len);
+            } else {
+                tcp_chr_websocket_process_data(chr, buf, len,
+                        s->ws.first_code & WS_OPCODE_MASK);
+            }
+            s->ws.count += len;
+            if (!s->ws.payload_len) {
+end_payload:
+                if (s->ws.code & WS_OPCODE_CONTROL) {
+                    /* Handle control messages now */
+                    tcp_chr_websocket_process_control(chr,
+                        s->ws.code & WS_OPCODE_MASK,
+                        s->ws.controldata, s->ws.count);
+                } else if (s->ws.code & WS_FIN) {
+                    /* Maybe FIN=1 means something */
+                    tcp_chr_websocket_process_fin(chr,
+                        s->ws.first_code & WS_OPCODE_MASK);
+                    s->ws.first_code = 0;
+                }
+                if (s->ws.state != WEBSOCKET_STATE_CLOSED) {
+                    /* Get ready for more */
+                    tcp_chr_websocket_process_start(chr);
+                }
+            }
+            break;
+        }
+    }
+}
+
+/* upgrade a HTTP session to a websocket connection */
+static void tcp_chr_http_upgrade_websocket(CharDriverState *chr,
+                 TCPCharDriver *s, QString *key, const char *uri)
+{
+    char hdrs[1024];
+    QString *accept;
+
+    qstring_append(key, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    accept = sha1_base64(key);
+    if (!accept) {
+        tcp_chr_http_abort(chr, 500);
+        return;
+    }
+
+    tcp_chr_http_send_status(chr, 101);
+    snprintf(hdrs, sizeof hdrs,
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: %s\r\n"
+        "\r\n", qstring_get_str(accept));
+    send_all(s->fd, hdrs, strlen(hdrs));
+    QDECREF(accept);
+    s->http.state = HTTP_STATE_WEBSOCKET;
+
+    /* Switch to websocket protocol */
+    s->proto = TCP_PROTO_WEBSOCKET;
+    s->ws.first_code = 0;
+    tcp_chr_websocket_process_start(chr);
+}
+
+/* look up the content-type for a file extension in /etc/mime.types */
+static const char *
+mime_type_lookup(const char *ext)
+{
+    FILE *mt = fopen("/etc/mime.types", "r");
+    static char line[4096];
+    char *p, *line_type, *line_ext;
+    if (!mt) {
+        return NULL;
+    }
+    while ((p = fgets(line, sizeof line, mt))) {
+        while (*p && qemu_isspace(*p)) {        /* skip leading space */
+            p++;
+        }
+        line_type = p;                          /* mime type starts here */
+        if (!*p || *p == '#') {
+            continue;                           /* ignore blank and comments */
+        }
+        while (*p && !qemu_isspace(*p)) {
+            p++;                                /* skip to end of mime type */
+        }
+        if (*p) {
+            *p++ = '\0';                        /* terminate type in situ */
+        }
+        do {
+            while (*p && qemu_isspace(*p)) {
+                p++;                            /* skip whitespace */
+            }
+            line_ext = p;                       /* extension starts here */
+            while (*p && !qemu_isspace(*p)) {
+                p++;                            /* skip to end of extension */
+            }
+            if (*p) {
+                *p++ = '\0';                    /* terminate extension */
+            }
+            if (*line_ext && strcmp(line_ext, ext) == 0) {
+                fclose(mt);
+                return line_type;               /* matched an extension */
+            }
+        } while (*p);
+    }
+    fclose(mt);
+    return NULL;
+}
+
+/* process a fully received HTTP request */
+static void tcp_chr_http_process_request(CharDriverState *chr,
+                                         TCPCharDriver *s)
+{
+    const char *upgrade;
+    const char *uri;
+    const char *uriext;
+    const char *webroot = "webroot";
+    char *path;
+    int pathlen;
+    FILE *file;
+    char buf[4096];
+    const char *content_type;
+    int len;
+    off_t content_length;
+
+    uri = tcp_chr_process_http_hdr(s, "URI");
+    upgrade = tcp_chr_process_http_hdr(s, "upgrade");
+    fprintf(stderr, "GET %s\n", uri);
+    if (upgrade) {
+        const char *version_str;
+        int version = 0;
+        QObject *key;
+
+        version_str = tcp_chr_process_http_hdr(s, "sec-websocket-version");
+        if (version_str) {
+            version = atoi(version_str);
+        }
+        key = qdict_get(s->http.req, "sec-websocket-key");
+        if (strcmp(upgrade, "websocket") != 0 || version != 13 || !key) {
+            /* Tell client to use v13 */
+            static const char hdrs[] =
+                "Sec-WebSocket-Version: 13\r\n"
+                "\r\n";
+            tcp_chr_http_send_status(chr, 400);
+            send_all(s->fd, hdrs, strlen(hdrs));
+            tcp_chr_http_abort(chr, 0);
+            return;
+        }
+        qobject_incref(key);
+        tcp_chr_http_upgrade_websocket(chr, s, qobject_to_qstring(key), uri);
+        qobject_decref(key);
+        return;
+    }
+
+    /* Try to open the requested file */
+    while (*uri == '/')
+        uri++; /* drop leading / */
+    if (*uri == '.' || strstr(uri, "/.")) {
+        /* Reject URIs involving dotfiles */
+        tcp_chr_http_abort(chr, 404);
+        return;
+    }
+    if (!*uri) {
+        uri = "index.html";
+    }
+
+    /* Translate URI to a file path */
+    pathlen = strlen(webroot) + 1 + strlen(uri);
+    path = malloc(pathlen + 1);
+    snprintf(path, pathlen + 1, "%s/%s", webroot, uri);
+    file = fopen(path, "rb");
+    if (!file) {
+        fprintf(stderr, "%s: %s\n", path, strerror(errno));
+        free(path);
+        tcp_chr_http_abort(chr, 404);
+        return;
+    }
+    free(path);
+
+    /* Content length */
+    if (fseek(file, 0, SEEK_END) < 0) {
+        fclose(file);
+        tcp_chr_http_abort(chr, 500);
+        return;
+    }
+    content_length = ftell(file);
+    rewind(file);
+
+    /* Content type */
+    content_type = NULL;
+    uriext = strrchr(uri, '.');
+    if (uriext) {
+        content_type = mime_type_lookup(uriext + 1);
+    }
+    if (!content_type) {
+        content_type = "application/octet-stream";
+    }
+
+    /* Send file metadata */
+    tcp_chr_http_send_status(chr, content_length == 0 ? 204 : 200);
+    snprintf(buf, sizeof buf,
+        "Content-type: %s\r\n"
+        "Connection: close\r\n"         /* TODO: hmm */
+        "Content-length: %lu\r\n"
+        "\r\n",                         /* TODO: Last-modified */
+        content_type,
+        (unsigned long)content_length);
+    send_all(s->fd, buf, strlen(buf));
+
+    /* Send file content */
+    while (content_length > 0) {
+        len = fread(buf, 1, MIN(content_length, sizeof buf), file);
+        if (len <= 0) {
+            tcp_chr_http_abort(chr, 0);
+            break;
+        }
+        send_all(s->fd, buf, len);
+        content_length -= len;
+    }
+    fclose(file);
+
+    if (s->http.state != HTTP_STATE_ABORT) {
+//      const char *connection;
+//      connection = tcp_chr_process_http_hdr(s, "connection");
+//      if (connection && strcmp(connection, "close") == 0) {
+            tcp_chr_http_abort(chr, 0);
+//      }
+    }
+
+    /* End of request */
+    if (s->http.state != HTTP_STATE_ABORT) {
+        tcp_chr_http_init(chr);
+    }
+}
+
+static int hex2decimal(char ch)
+{
+    return (ch & 0x4f) % 55; /* (snicker) */
+}
+
+/* process a received HTTP request line (1st line) */
+static void tcp_chr_http_process_request_line(CharDriverState *chr,
+                                 TCPCharDriver *s,
+                                 char *buf, int len)
+{
+    char *uri_start, *uri, *p;
+
+    p = buf;
+    if (!strstart(p, "GET ", (const char **)&p)) {
+        tcp_chr_http_abort(chr, 405); /* Method not allowed */
+        return;
+    }
+    while (*p == ' ') p++;
+
+    /* expand URI %xx in situ */
+    uri = uri_start = p;
+    while (*p && *p != ' ') {
+        if (p[0] == '%' && qemu_isxdigit(p[1]) && qemu_isxdigit(p[2])) {
+            *uri++ = (hex2decimal(p[1]) << 4) | hex2decimal(p[2]);
+            p += 3;
+        } else {
+            *uri++ = *p++;
+        }
+    }
+    if (*p != ' ') {
+        tcp_chr_http_abort(chr, 400); /* Bad Request */
+        return;
+    }
+    p++;
+    while (*p == ' ') p++;
+    if (!strstart(p, "HTTP/1.", NULL)) {
+        tcp_chr_http_abort(chr, 505); /* Version not supported */
+        return;
+    }
+    *uri = '\0';
+
+    /* store the URI in the req dict */
+    qdict_put_obj(s->http.req, "URI",
+        QOBJECT(qstring_from_substr(uri_start, 0, (uri - 1) - uri_start)));
+    s->http.state = HTTP_STATE_HEADERS;
+}
+
+/* process a received HTTP request header */
+static void tcp_chr_http_process_hdrline(CharDriverState *chr,
+                                 TCPCharDriver *s,
+                                 char *buf, int len)
+{
+    char *p, *val, *key, *key_end;
+
+    /* convert key part to lowercase, in situ */
+    for (key = p = buf; *p && !qemu_isspace(*p) && *p != ':'; p++) {
+        *p = qemu_tolower(*p);
+    }
+    key_end = p;
+
+    /* skip \s+:\s+ */
+    while (qemu_isspace(*p))
+        p++;
+    if (*p != ':') {
+        tcp_chr_http_abort(chr, 400); /* Bad Request */
+        return;
+    }
+    p++;
+    while (qemu_isspace(*p))
+        p++;
+
+    *key_end = '\0';
+    val = p;
+
+    /* Remove trailing whitespace from value */
+    p += strlen(p);
+    while (p > val && qemu_isspace(p[-1]))
+        *--p = '\0';
+
+    /* store the header value to the req dict */
+    qdict_put_obj(s->http.req, key, QOBJECT(qstring_from_str(val)));
+}
+
+/* process bytes received over HTTP */
+static void tcp_chr_process_http(CharDriverState *chr,
+                                 TCPCharDriver *s,
+                                 uint8_t *buf, int *size)
+{
+    int len;
+    char ch;
+
+    while (*size) {
+        switch (s->http.state) {
+        case HTTP_STATE_ABORT:
+            *size = 0;
+            break;
+        case HTTP_STATE_REQUEST:
+        case HTTP_STATE_HEADERS:
+            /* Append the character to the current line.buf */
+            if (s->http.line.len >= s->http.line.maxlen) {
+                tcp_chr_http_abort(chr, 431); /* Too long */
+                break;
+            }
+            ch = s->http.line.buf[s->http.line.len++] = *buf++;
+            --*size;
+
+            /* Check for end of line cases */
+            if (s->http.line.len == 2 &&
+                s->http.line.buf[0] == '\r' &&
+                s->http.line.buf[1] == '\n')
+            {
+                /* Received an empty line: end of request */
+                tcp_chr_http_process_request(chr, s);
+            }
+            else if (s->http.line.len >= 3 &&
+                s->http.line.buf[s->http.line.len - 3] == '\r' &&
+                s->http.line.buf[s->http.line.len - 2] == '\n')
+            {
+                /* Received non-empty line, CRLF and another char */
+                len = (s->http.line.len -= 3);
+                s->http.line.buf[len] = '\0';
+                if (ch == ' ' || ch == '\t') {
+                    /* The CRLF was followed by whitespace:
+                     * consume the whitespace and join the lines */
+                    break;
+                }
+                if (s->http.state == HTTP_STATE_REQUEST) {
+                    /* First line is the request line (method, uri) */
+                    tcp_chr_http_process_request_line(chr, s, s->http.line.buf, len);
+                } else {
+                    /* Received a normal header line */
+                    tcp_chr_http_process_hdrline(chr, s, s->http.line.buf, len);
+                }
+                s->http.line.len = 0;
+                s->http.line.buf[s->http.line.len++] = ch;
+            }
+            break;
+        case HTTP_STATE_WEBSOCKET:
+            tcp_chr_process_websocket(chr, s, buf, size);
+            break;
+        }
     }
 }
 
@@ -2850,6 +3567,8 @@ static gboolean tcp_chr_accept(GIOChannel *channel, GIOCondition cond, void *opa
             s->listen_tag = 0;
             return FALSE;
         } else if (fd >= 0) {
+            if (s->proto == TCP_PROTO_HTTP)
+                tcp_chr_http_init(chr);
             if (s->do_telnetopt)
                 tcp_chr_telnet_init(fd);
             break;
@@ -2891,12 +3610,15 @@ static void tcp_chr_close(CharDriverState *chr)
     if (s->write_msgfds_num) {
         g_free(s->write_msgfds);
     }
+    QDECREF(s->http.req);
+    g_free(s->http.line.buf);
     g_free(s);
     qemu_chr_be_event(chr, CHR_EVENT_CLOSED);
 }
 
 static CharDriverState *qemu_chr_open_socket_fd(int fd, bool do_nodelay,
-                                                bool is_listen, bool is_telnet,
+                                                bool is_listen,
+                                                const char *proto,
                                                 bool is_waitconnect,
                                                 Error **errp)
 {
@@ -2943,7 +3665,7 @@ static CharDriverState *qemu_chr_open_socket_fd(int fd, bool do_nodelay,
         getnameinfo((struct sockaddr *) &ss, ss_len, host, sizeof(host),
                     serv, sizeof(serv), NI_NUMERICHOST | NI_NUMERICSERV);
         snprintf(chr->filename, 256, "%s:%s%s%s:%s%s",
-                 is_telnet ? "telnet" : "tcp",
+                 proto ? proto : "tcp",
                  left, host, right, serv,
                  is_listen ? ",server" : "");
         break;
@@ -2961,11 +3683,21 @@ static CharDriverState *qemu_chr_open_socket_fd(int fd, bool do_nodelay,
     /* be isn't opened until we get a connection */
     chr->explicit_be_open = true;
 
+    if (strcmp(proto, "telnet") == 0) {
+        s->proto = TCP_PROTO_TELNET;
+    } else if (strcmp(proto, "http") == 0) {
+        s->proto = TCP_PROTO_HTTP;
+    } else {
+        if (strcmp(proto, "") != 0 && strcmp(proto, "raw") != 0) {
+            fprintf(stderr, "unknown proto '%s'\n", proto);
+        }
+        s->proto = TCP_PROTO_NONE;
+    }
     if (is_listen) {
         s->listen_fd = fd;
         s->listen_chan = io_channel_from_socket(s->listen_fd);
         s->listen_tag = g_io_add_watch(s->listen_chan, G_IO_IN, tcp_chr_accept, chr);
-        if (is_telnet) {
+        if (s->proto == TCP_PROTO_TELNET) {
             s->do_telnetopt = 1;
         }
     } else {
@@ -2996,6 +3728,12 @@ static CharDriverState *qemu_chr_open_socket(QemuOpts *opts)
     bool is_telnet      = qemu_opt_get_bool(opts, "telnet", false);
     bool do_nodelay     = !qemu_opt_get_bool(opts, "delay", true);
     bool is_unix        = qemu_opt_get(opts, "path") != NULL;
+    const char *proto   = qemu_opt_get(opts, "proto");
+
+    if (!proto) {
+        proto = is_telnet ? "telnet" : "";
+    }
+    is_telnet = strcmp(proto, "telnet") == 0;
 
     if (is_unix) {
         if (is_listen) {
@@ -3017,7 +3755,7 @@ static CharDriverState *qemu_chr_open_socket(QemuOpts *opts)
     if (!is_waitconnect)
         qemu_set_nonblock(fd);
 
-    chr = qemu_chr_open_socket_fd(fd, do_nodelay, is_listen, is_telnet,
+    chr = qemu_chr_open_socket_fd(fd, do_nodelay, is_listen, proto,
                                   is_waitconnect, &local_err);
     if (local_err) {
         goto fail;
@@ -3313,7 +4051,7 @@ QemuOpts *qemu_chr_parse_compat(const char *label, const char *filename)
                 goto fail;
         }
         if (strstart(filename, "telnet:", &p))
-            qemu_opt_set(opts, "telnet", "on");
+            qemu_opt_set(opts, "proto", "telnet");
         return opts;
     }
     if (strstart(filename, "udp:", &p)) {
@@ -3828,6 +4566,9 @@ QemuOptsList qemu_chardev_opts = {
             .name = "telnet",
             .type = QEMU_OPT_BOOL,
         },{
+            .name = "proto",
+            .type = QEMU_OPT_STRING,
+        },{
             .name = "width",
             .type = QEMU_OPT_NUMBER,
         },{
@@ -3974,7 +4715,7 @@ static CharDriverState *qmp_chardev_open_socket(ChardevSocket *sock,
     SocketAddress *addr = sock->addr;
     bool do_nodelay     = sock->has_nodelay ? sock->nodelay : false;
     bool is_listen      = sock->has_server  ? sock->server  : true;
-    bool is_telnet      = sock->has_telnet  ? sock->telnet  : false;
+    const char *proto   = sock->proto       ? sock->proto   : "";
     bool is_waitconnect = sock->has_wait    ? sock->wait    : false;
     int fd;
 
@@ -3987,7 +4728,7 @@ static CharDriverState *qmp_chardev_open_socket(ChardevSocket *sock,
         return NULL;
     }
     return qemu_chr_open_socket_fd(fd, do_nodelay, is_listen,
-                                   is_telnet, is_waitconnect, errp);
+                                   proto, is_waitconnect, errp);
 }
 
 static CharDriverState *qmp_chardev_open_udp(ChardevUdp *udp,

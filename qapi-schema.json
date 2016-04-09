@@ -2646,8 +2646,8 @@
 # @wait: #optional wait for incoming connection on server
 #        sockets (default: false).
 # @nodelay: #optional set TCP_NODELAY socket option (default: false)
-# @telnet: #optional enable telnet protocol on server
-#          sockets (default: false)
+# @proto: describes protocol to use server, e.g "telnet"
+#          (default: "")
 #
 # Since: 1.4
 ##
@@ -2655,7 +2655,7 @@
                                      '*server'  : 'bool',
                                      '*wait'    : 'bool',
                                      '*nodelay' : 'bool',
-                                     '*telnet'  : 'bool' } }
+                                     'proto'    : 'str' } }
 
 ##
 # @ChardevUdp:
