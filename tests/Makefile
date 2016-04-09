@@ -51,7 +51,9 @@ gcov-files-test-x86-cpuid-y =
 check-unit-y += tests/test-xbzrle$(EXESUF)
 gcov-files-test-xbzrle-y = xbzrle.c
 check-unit-y += tests/test-cutils$(EXESUF)
-gcov-files-test-cutils-y += util/cutils.c
+gcov-files-test-sha1-y += util/cutils.c
+check-unit-y += tests/test-sha1$(EXESUF)
+gcov-files-test-sha1-y += util/sha1.c
 check-unit-y += tests/test-mul64$(EXESUF)
 gcov-files-test-mul64-y = util/host-utils.c
 check-unit-y += tests/test-int128$(EXESUF)
@@ -245,6 +247,7 @@ tests/test-hbitmap$(EXESUF): tests/test-hbitmap.o libqemuutil.a libqemustub.a
 tests/test-x86-cpuid$(EXESUF): tests/test-x86-cpuid.o
 tests/test-xbzrle$(EXESUF): tests/test-xbzrle.o xbzrle.o page_cache.o libqemuutil.a
 tests/test-cutils$(EXESUF): tests/test-cutils.o util/cutils.o
+tests/test-sha1$(EXESUF): tests/test-sha1.o util/sha1.o
 tests/test-int128$(EXESUF): tests/test-int128.o
 tests/test-qdev-global-props$(EXESUF): tests/test-qdev-global-props.o \
 	hw/core/qdev.o hw/core/qdev-properties.o hw/core/hotplug.o\
