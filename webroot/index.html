@@ -1,0 +1,41 @@
+<html>
+ <!--
+
+  Simple demo for QMP over websocket from a web browser front-end
+
+  arm-softmmu/qemu-system-arm -M stm32-p103 \
+    -chardev socket,id=qmp,port=8000,host=*,server,proto=http,wait=off \
+    -mon chardev=qmp,mode=control,pretty=on \
+    -kernel ../main.bin
+
+   -->
+ <head>
+  <link rel="shortcut icon" href="data:image/x-icon;," type="image/x-icon">
+  <script type="text/javascript" src="qmp.js"></script>
+  <script type="text/javascript">
+
+    window.onload = function (e) {
+        var u = new URL(document.baseURI);
+        u.protocol = "ws:";
+        u.pathname = "/qmp";
+
+        console.log("connecting to", u.href);
+        var qmp = new QMP(u.href)
+
+        document.getElementById("get-status-button").onclick = function(o) {
+            qmp.execute("query-status").then(function(result) {
+                var out = document.getElementById("get-status-result")
+                out.value = JSON.stringify(result)
+                console.log("query-status:", result)
+            })
+        }
+    }
+  </script>
+ </head>
+ <body>
+  <h1>QMP over websocket demo</h1>
+  <button id="get-status-button">Get-Status</button>
+  <br>
+  <textarea id="get-status-result"></textarea>
+ </body>
+</html>
