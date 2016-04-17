@@ -56,6 +56,8 @@ check-unit-y += tests/test-sha1$(EXESUF)
 gcov-files-test-sha1-y += util/sha1.c
 check-unit-y += tests/test-vector$(EXESUF)
 gcov-files-test-vector-y += util/vector.c
+check-unit-y += tests/test-wire$(EXESUF)
+gcov-files-test-wire-y += util/wire.c
 check-unit-y += tests/test-mul64$(EXESUF)
 gcov-files-test-mul64-y = util/host-utils.c
 check-unit-y += tests/test-int128$(EXESUF)
@@ -251,6 +253,9 @@ tests/test-xbzrle$(EXESUF): tests/test-xbzrle.o xbzrle.o page_cache.o libqemuuti
 tests/test-cutils$(EXESUF): tests/test-cutils.o util/cutils.o
 tests/test-sha1$(EXESUF): tests/test-sha1.o util/sha1.o
 tests/test-vector$(EXESUF): tests/test-vector.o util/vector.o
+tests/test-wire$(EXESUF): tests/test-wire.o hw/core/wire.o \
+        hw/core/irq.o \
+        util/vector.o $(qom-core-obj) libqemuutil.a libqemustub.a
 tests/test-int128$(EXESUF): tests/test-int128.o
 tests/test-qdev-global-props$(EXESUF): tests/test-qdev-global-props.o \
 	hw/core/qdev.o hw/core/qdev-properties.o hw/core/hotplug.o\
