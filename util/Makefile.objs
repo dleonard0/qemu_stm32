@@ -16,3 +16,4 @@ util-obj-y += getauxval.o
 util-obj-y += readline.o
 util-obj-y += rfifolock.o
 util-obj-y += sha1.o
+util-obj-y += vector.o
