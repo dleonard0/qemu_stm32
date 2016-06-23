@@ -11,6 +11,9 @@
 # QAPI event definitions
 { 'include': 'qapi/event.json' }
 
+# Wire definitions
+{ 'include': 'qapi/wire.json' }
+
 ##
 # LostTickPolicy:
 #

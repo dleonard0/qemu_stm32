@@ -1,0 +1,43 @@
+
+##
+# @WIRE_CHANGED
+#
+# Emitted when the guest alters the value of a watched wire.
+# No further change events for that wire will be reported until
+# the wire's value is read.
+#
+# @name  the name of the wire
+##
+{ 'event': 'WIRE_CHANGED',
+  'data': { 'name': 'str' } }
+
+{ 'command': 'wire-listen',
+  'data': { 'name': 'str' } }
+
+{ 'command': 'wire-get-value',
+  'data': { 'name': 'str' },
+  'returns': 'bool' }
+
+{ 'command': 'wire-get-avalue',
+  'data': { 'name': 'str' },
+  'returns': 'int' }
+
+# Wire driving
+
+{ 'command': 'wire-driver-create',
+  'data': { 'name': 'str' },
+  'returns': 'int' }
+
+{ 'command': 'wire-driver-destroy',
+  'data': { 'id': 'int' } }
+
+{ 'command': 'wire-driver-set-value',
+  'data': { 'id': 'int',
+            'strength': 'int',
+            'value' : 'bool' } }
+
+{ 'command': 'wire-driver-set-avalue',
+  'data': { 'id': 'int',
+            'strength': 'int',
+            'avalue' : 'int' } }
+
